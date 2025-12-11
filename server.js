@@ -3,6 +3,7 @@ const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { createClient } = require('@supabase/supabase-js');
+const { OAuth2Client } = require('google-auth-library');
 require('dotenv').config();
 
 const app = express();
@@ -13,6 +14,9 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
+
+// Initialize Google OAuth client
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // Middleware
 app.use(cors());
@@ -108,9 +112,32 @@ app.post('/api/auth/register', async (req, res) => {
     if (role === 'teacher') {
       await supabase.from('teachers').insert([{ user_id: newUser.id }]);
     } else if (role === 'student') {
-      const studentNumber = `STU${String(newUser.id).padStart(6, '0')}`;
+      // Get next sequence number
+      const { data: seqData, error: seqError } = await supabase
+        .rpc('get_next_student_number');
+      
+      let studentSequence = 1;
+      if (!seqError && seqData) {
+        studentSequence = seqData;
+      } else {
+        // Fallback: get max sequence + 1
+        const { data: maxStudent } = await supabase
+          .from('students')
+          .select('student_sequence')
+          .order('student_sequence', { ascending: false })
+          .limit(1)
+          .single();
+        
+        studentSequence = (maxStudent?.student_sequence || 0) + 1;
+      }
+      
+      const studentNumber = `STU-${String(studentSequence).padStart(4, '0')}`;
       await supabase.from('students').insert([
-        { user_id: newUser.id, student_number: studentNumber }
+        { 
+          user_id: newUser.id, 
+          student_number: studentNumber,
+          student_sequence: studentSequence
+        }
       ]);
     } else if (role === 'parent') {
       await supabase.from('parents').insert([{ user_id: newUser.id }]);
@@ -282,14 +309,42 @@ app.post('/api/auth/login', async (req, res) => {
         `)
         .eq('parent_id', parent?.id);
 
-      userData.linkedStudents = links?.map(l => ({
-        id: l.students.id,
-        studentNumber: l.students.student_number,
-        name: l.students.users.name,
-        grade: l.students.grade,
-        teacher: 'TBD',
-        classes: []
-      })) || [];
+      // Get enrollments and classes for each student
+      const studentsWithDetails = await Promise.all(
+        (links || []).map(async (link) => {
+          const student = link.students;
+          
+          const { data: enrollments } = await supabase
+            .from('enrollments')
+            .select(`
+              class_id,
+              classes (
+                class_name,
+                subject,
+                teacher_id,
+                teachers (
+                  user_id,
+                  users (name)
+                )
+              )
+            `)
+            .eq('student_id', student.id);
+
+          const classes = enrollments?.map(e => e.classes.class_name) || [];
+          const teacherName = enrollments?.[0]?.classes?.teachers?.users?.name || 'No teacher assigned';
+
+          return {
+            id: student.id,
+            studentNumber: student.student_number,
+            name: student.users.name,
+            grade: student.grade,
+            teacher: teacherName,
+            classes
+          };
+        })
+      );
+
+      userData.linkedStudents = studentsWithDetails;
     }
 
     const duration = Date.now() - startTime;
@@ -303,7 +358,469 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Get user profile (protected route)
+// Google OAuth Login
+app.post('/api/auth/google', async (req, res) => {
+  const startTime = Date.now();
+  console.log('[GOOGLE-AUTH] Starting Google authentication...');
+  
+  try {
+    const { credential, role } = req.body;
+    console.log(`[GOOGLE-AUTH] Request with role: ${role}`);
+
+    if (!credential) {
+      console.log('[GOOGLE-AUTH] Missing credential');
+      return res.status(400).json({ error: 'Google credential is required' });
+    }
+
+    // Verify Google token
+    console.log('[GOOGLE-AUTH] Verifying Google token...');
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: process.env.GOOGLE_CLIENT_ID
+    });
+
+    const payload = ticket.getPayload();
+    const { email, name, sub: googleId } = payload;
+    console.log(`[GOOGLE-AUTH] Token verified for: ${email}`);
+
+    // Check if user exists
+    let { data: user } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email)
+      .single();
+
+    if (!user) {
+      // New user - role is required
+      if (!role || !['student', 'teacher', 'parent'].includes(role)) {
+        console.log('[GOOGLE-AUTH] Invalid role for new user');
+        return res.status(400).json({ error: 'Valid role is required for new user' });
+      }
+
+      // Create new user
+      console.log('[GOOGLE-AUTH] Creating new user...');
+      const { data: newUser, error: userError } = await supabase
+        .from('users')
+        .insert([
+          {
+            email,
+            password: '', // No password for Google OAuth users
+            name,
+            role,
+            google_id: googleId,
+            is_new_user: true
+          }
+        ])
+        .select()
+        .single();
+
+      if (userError) {
+        console.error('[GOOGLE-AUTH] User creation error:', userError);
+        return res.status(500).json({ error: 'Failed to create user' });
+      }
+
+      user = newUser;
+      console.log(`[GOOGLE-AUTH] User created with ID: ${user.id}`);
+
+      // Create role-specific record
+      if (role === 'teacher') {
+        await supabase.from('teachers').insert([{ user_id: user.id }]);
+      } else if (role === 'student') {
+        const { data: seqData } = await supabase.rpc('get_next_student_number');
+        let studentSequence = seqData || 1;
+        const studentNumber = `STU-${String(studentSequence).padStart(4, '0')}`;
+        await supabase.from('students').insert([
+          { 
+            user_id: user.id, 
+            student_number: studentNumber,
+            student_sequence: studentSequence
+          }
+        ]);
+      } else if (role === 'parent') {
+        await supabase.from('parents').insert([{ user_id: user.id }]);
+      }
+    } else {
+      // Existing user - use their existing role
+      console.log(`[GOOGLE-AUTH] Existing user found with role: ${user.role}`);
+      
+      // Update google_id if not set
+      if (!user.google_id) {
+        await supabase
+          .from('users')
+          .update({ google_id: googleId })
+          .eq('id', user.id);
+      }
+    }
+
+    // Generate token
+    const token = jwt.sign(
+      { userId: user.id, email: user.email, role: user.role },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    // Get role-specific data (same as login)
+    let userData = {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role,
+      isNewUser: user.is_new_user
+    };
+
+    if (user.role === 'student') {
+      const { data: student } = await supabase
+        .from('students')
+        .select('*')
+        .eq('user_id', user.id)
+        .single();
+
+      userData.studentNumber = student?.student_number;
+      userData.grade = student?.grade;
+
+      const { data: enrollments } = await supabase
+        .from('enrollments')
+        .select(`
+          *,
+          classes (
+            *,
+            teachers (
+              users (name)
+            )
+          )
+        `)
+        .eq('student_id', student?.id);
+
+      userData.enrolledClasses = enrollments?.map(e => ({
+        id: e.classes.id,
+        classCode: e.classes.class_code,
+        className: e.classes.class_name,
+        teacher: e.classes.teachers.users.name,
+        subject: e.classes.subject,
+        grade: e.classes.grade,
+        progress: e.progress
+      })) || [];
+    } else if (user.role === 'teacher') {
+      const { data: teacher } = await supabase
+        .from('teachers')
+        .select('*')
+        .eq('user_id', user.id)
+        .single();
+
+      const { data: classes } = await supabase
+        .from('classes')
+        .select('*')
+        .eq('teacher_id', teacher?.id);
+
+      userData.classes = classes?.map(c => ({
+        id: c.id,
+        classCode: c.class_code,
+        className: c.class_name,
+        subject: c.subject,
+        grade: c.grade,
+        students: [],
+        announcements: [],
+        activities: []
+      })) || [];
+    } else if (user.role === 'parent') {
+      const { data: parent } = await supabase
+        .from('parents')
+        .select('*')
+        .eq('user_id', user.id)
+        .single();
+
+      const { data: links } = await supabase
+        .from('parent_student_links')
+        .select(`
+          *,
+          students (
+            *,
+            users (name, email)
+          )
+        `)
+        .eq('parent_id', parent?.id);
+
+      const studentsWithDetails = await Promise.all(
+        (links || []).map(async (link) => {
+          const student = link.students;
+          
+          const { data: enrollments } = await supabase
+            .from('enrollments')
+            .select(`
+              class_id,
+              classes (
+                class_name,
+                subject,
+                teacher_id,
+                teachers (
+                  user_id,
+                  users (name)
+                )
+              )
+            `)
+            .eq('student_id', student.id);
+
+          const classes = enrollments?.map(e => e.classes.class_name) || [];
+          const teacherName = enrollments?.[0]?.classes?.teachers?.users?.name || 'No teacher assigned';
+
+          return {
+            id: student.id,
+            studentNumber: student.student_number,
+            name: student.users.name,
+            grade: student.grade,
+            teacher: teacherName,
+            classes
+          };
+        })
+      );
+
+      userData.linkedStudents = studentsWithDetails;
+    }
+
+    const duration = Date.now() - startTime;
+    console.log(`[GOOGLE-AUTH] Authentication completed in ${duration}ms`);
+
+    res.json({ token, user: userData });
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    console.error(`[GOOGLE-AUTH] Error after ${duration}ms:`, error);
+    res.status(500).json({ error: 'Authentication failed' });
+  }
+});
+
+// Facebook OAuth Login
+app.post('/api/auth/facebook', async (req, res) => {
+  const startTime = Date.now();
+  console.log('[FACEBOOK-AUTH] Starting Facebook authentication...');
+  
+  try {
+    const { accessToken, userID, role } = req.body;
+    console.log(`[FACEBOOK-AUTH] Request with role: ${role}`);
+
+    if (!accessToken || !userID) {
+      console.log('[FACEBOOK-AUTH] Missing credentials');
+      return res.status(400).json({ error: 'Facebook access token and user ID are required' });
+    }
+
+    // Verify Facebook token by fetching user data
+    console.log('[FACEBOOK-AUTH] Verifying Facebook token...');
+    const fbResponse = await fetch(`https://graph.facebook.com/me?fields=id,name,email&access_token=${accessToken}`);
+    const fbData = await fbResponse.json();
+
+    if (fbData.error || fbData.id !== userID) {
+      console.log('[FACEBOOK-AUTH] Invalid Facebook token');
+      return res.status(401).json({ error: 'Invalid Facebook credentials' });
+    }
+
+    const { email, name, id: facebookId } = fbData;
+    console.log(`[FACEBOOK-AUTH] Token verified for: ${email}`);
+
+    // Check if user exists
+    let { data: user } = await supabase
+      .from('users')
+      .select('*')
+      .eq('email', email)
+      .single();
+
+    if (!user) {
+      // New user - role is required
+      if (!role || !['student', 'teacher', 'parent'].includes(role)) {
+        console.log('[FACEBOOK-AUTH] Invalid role for new user');
+        return res.status(400).json({ error: 'Valid role is required for new user' });
+      }
+
+      // Create new user
+      console.log('[FACEBOOK-AUTH] Creating new user...');
+      const { data: newUser, error: userError } = await supabase
+        .from('users')
+        .insert([
+          {
+            email,
+            password: '', // No password for Facebook OAuth users
+            name,
+            role,
+            facebook_id: facebookId,
+            is_new_user: true
+          }
+        ])
+        .select()
+        .single();
+
+      if (userError) {
+        console.error('[FACEBOOK-AUTH] User creation error:', userError);
+        return res.status(500).json({ error: 'Failed to create user' });
+      }
+
+      user = newUser;
+      console.log(`[FACEBOOK-AUTH] User created with ID: ${user.id}`);
+
+      // Create role-specific record
+      if (role === 'teacher') {
+        await supabase.from('teachers').insert([{ user_id: user.id }]);
+      } else if (role === 'student') {
+        const { data: seqData } = await supabase.rpc('get_next_student_number');
+        let studentSequence = seqData || 1;
+        const studentNumber = `STU-${String(studentSequence).padStart(4, '0')}`;
+        await supabase.from('students').insert([
+          { 
+            user_id: user.id, 
+            student_number: studentNumber,
+            student_sequence: studentSequence
+          }
+        ]);
+      } else if (role === 'parent') {
+        await supabase.from('parents').insert([{ user_id: user.id }]);
+      }
+    } else {
+      // Existing user - use their existing role
+      console.log(`[FACEBOOK-AUTH] Existing user found with role: ${user.role}`);
+      
+      // Update facebook_id if not set
+      if (!user.facebook_id) {
+        await supabase
+          .from('users')
+          .update({ facebook_id: facebookId })
+          .eq('id', user.id);
+      }
+    }
+
+    // Generate token
+    const token = jwt.sign(
+      { userId: user.id, email: user.email, role: user.role },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    // Get role-specific data (same as login)
+    let userData = {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role,
+      isNewUser: user.is_new_user
+    };
+
+    if (user.role === 'student') {
+      const { data: student } = await supabase
+        .from('students')
+        .select('*')
+        .eq('user_id', user.id)
+        .single();
+
+      userData.studentNumber = student?.student_number;
+      userData.grade = student?.grade;
+
+      const { data: enrollments } = await supabase
+        .from('enrollments')
+        .select(`
+          *,
+          classes (
+            *,
+            teachers (
+              users (name)
+            )
+          )
+        `)
+        .eq('student_id', student?.id);
+
+      userData.enrolledClasses = enrollments?.map(e => ({
+        id: e.classes.id,
+        classCode: e.classes.class_code,
+        className: e.classes.class_name,
+        teacher: e.classes.teachers.users.name,
+        subject: e.classes.subject,
+        grade: e.classes.grade,
+        progress: e.progress
+      })) || [];
+    } else if (user.role === 'teacher') {
+      const { data: teacher } = await supabase
+        .from('teachers')
+        .select('*')
+        .eq('user_id', user.id)
+        .single();
+
+      const { data: classes } = await supabase
+        .from('classes')
+        .select('*')
+        .eq('teacher_id', teacher?.id);
+
+      userData.classes = classes?.map(c => ({
+        id: c.id,
+        classCode: c.class_code,
+        className: c.class_name,
+        subject: c.subject,
+        grade: c.grade,
+        students: [],
+        announcements: [],
+        activities: []
+      })) || [];
+    } else if (user.role === 'parent') {
+      const { data: parent } = await supabase
+        .from('parents')
+        .select('*')
+        .eq('user_id', user.id)
+        .single();
+
+      const { data: links } = await supabase
+        .from('parent_student_links')
+        .select(`
+          *,
+          students (
+            *,
+            users (name, email)
+          )
+        `)
+        .eq('parent_id', parent?.id);
+
+      const studentsWithDetails = await Promise.all(
+        (links || []).map(async (link) => {
+          const student = link.students;
+          
+          const { data: enrollments } = await supabase
+            .from('enrollments')
+            .select(`
+              class_id,
+              classes (
+                class_name,
+                subject,
+                teacher_id,
+                teachers (
+                  user_id,
+                  users (name)
+                )
+              )
+            `)
+            .eq('student_id', student.id);
+
+          const classes = enrollments?.map(e => e.classes.class_name) || [];
+          const teacherName = enrollments?.[0]?.classes?.teachers?.users?.name || 'No teacher assigned';
+
+          return {
+            id: student.id,
+            studentNumber: student.student_number,
+            name: student.users.name,
+            grade: student.grade,
+            teacher: teacherName,
+            classes
+          };
+        })
+      );
+
+      userData.linkedStudents = studentsWithDetails;
+    }
+
+    const duration = Date.now() - startTime;
+    console.log(`[FACEBOOK-AUTH] Authentication completed in ${duration}ms`);
+
+    res.json({ token, user: userData });
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    console.error(`[FACEBOOK-AUTH] Error after ${duration}ms:`, error);
+    res.status(500).json({ error: 'Authentication failed' });
+  }
+});
+
+// Get user profile
 app.get('/api/auth/profile', authenticateToken, async (req, res) => {
   try {
     const { data: user } = await supabase
@@ -359,9 +876,83 @@ app.get('/api/auth/profile', authenticateToken, async (req, res) => {
         progress: e.progress
       })) || [];
     } else if (user.role === 'teacher') {
-      userData.classes = [];
+      const { data: teacher } = await supabase
+        .from('teachers')
+        .select('*')
+        .eq('user_id', user.id)
+        .single();
+
+      // Get classes
+      const { data: classes } = await supabase
+        .from('classes')
+        .select('*')
+        .eq('teacher_id', teacher?.id);
+
+      userData.classes = classes?.map(c => ({
+        id: c.id,
+        classCode: c.class_code,
+        className: c.class_name,
+        subject: c.subject,
+        grade: c.grade,
+        students: [],
+        announcements: [],
+        activities: []
+      })) || [];
     } else if (user.role === 'parent') {
-      userData.linkedStudents = [];
+      const { data: parent } = await supabase
+        .from('parents')
+        .select('*')
+        .eq('user_id', user.id)
+        .single();
+
+      // Get linked students
+      const { data: links } = await supabase
+        .from('parent_student_links')
+        .select(`
+          *,
+          students (
+            *,
+            users (name, email)
+          )
+        `)
+        .eq('parent_id', parent?.id);
+
+      // Get enrollments and classes for each student
+      const studentsWithDetails = await Promise.all(
+        (links || []).map(async (link) => {
+          const student = link.students;
+          
+          const { data: enrollments } = await supabase
+            .from('enrollments')
+            .select(`
+              class_id,
+              classes (
+                class_name,
+                subject,
+                teacher_id,
+                teachers (
+                  user_id,
+                  users (name)
+                )
+              )
+            `)
+            .eq('student_id', student.id);
+
+          const classes = enrollments?.map(e => e.classes.class_name) || [];
+          const teacherName = enrollments?.[0]?.classes?.teachers?.users?.name || 'No teacher assigned';
+
+          return {
+            id: student.id,
+            studentNumber: student.student_number,
+            name: student.users.name,
+            grade: student.grade,
+            teacher: teacherName,
+            classes
+          };
+        })
+      );
+
+      userData.linkedStudents = studentsWithDetails;
     }
 
     res.json({ user: userData });
@@ -380,6 +971,347 @@ function generateClassCode() {
   }
   return code;
 }
+
+// ============================================
+// PARENT ENDPOINTS
+// ============================================
+
+// Link parent to student
+app.post('/api/parent/link-student', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'parent') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { studentNumber } = req.body;
+    console.log('[LINK-STUDENT] Request received:', { studentNumber, userId: req.user.userId });
+
+    if (!studentNumber) {
+      return res.status(400).json({ error: 'Student number is required' });
+    }
+
+    // Normalize student number (uppercase and handle with/without dash)
+    let normalizedInput = studentNumber.toUpperCase().trim();
+    
+    // Ensure format is STU-XXXX (add dash if missing)
+    if (normalizedInput.startsWith('STU') && !normalizedInput.includes('-')) {
+      normalizedInput = 'STU-' + normalizedInput.substring(3);
+    }
+    
+    console.log('[LINK-STUDENT] Searching for student:', normalizedInput);
+    
+    // Find the student by student number (exact match, case-insensitive)
+    const { data: student, error: studentError } = await supabase
+      .from('students')
+      .select('id, user_id, student_number, grade')
+      .ilike('student_number', normalizedInput)
+      .maybeSingle();
+
+    console.log('[LINK-STUDENT] Student search result:', { student, error: studentError });
+
+    if (studentError || !student) {
+      console.error('[LINK-STUDENT] Student not found:', studentError);
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    // Get parent record
+    console.log('[LINK-STUDENT] Looking for parent with user_id:', req.user.userId);
+    const { data: parent, error: parentError } = await supabase
+      .from('parents')
+      .select('id')
+      .eq('user_id', req.user.userId)
+      .single();
+
+    console.log('[LINK-STUDENT] Parent search result:', { parent, error: parentError });
+
+    if (parentError || !parent) {
+      console.error('[LINK-STUDENT] Parent not found:', parentError);
+      return res.status(404).json({ error: 'Parent not found' });
+    }
+
+    // Check if link already exists
+    const { data: existingLink } = await supabase
+      .from('parent_student_links')
+      .select('id')
+      .eq('parent_id', parent.id)
+      .eq('student_id', student.id)
+      .single();
+
+    if (existingLink) {
+      return res.status(400).json({ error: 'Student already linked' });
+    }
+
+    // Create the link
+    const { error: linkError } = await supabase
+      .from('parent_student_links')
+      .insert({
+        parent_id: parent.id,
+        student_id: student.id
+      });
+
+    if (linkError) {
+      console.error('Error linking student:', linkError);
+      return res.status(500).json({ error: 'Failed to link student' });
+    }
+
+    // Get student details with user info
+    const { data: studentUser, error: userError } = await supabase
+      .from('users')
+      .select('name, email')
+      .eq('id', student.user_id)
+      .single();
+
+    if (userError) {
+      console.error('Error fetching student user:', userError);
+      return res.status(500).json({ error: 'Failed to fetch student details' });
+    }
+
+    // Get student's enrolled classes
+    const { data: enrollments, error: enrollError } = await supabase
+      .from('enrollments')
+      .select(`
+        class_id,
+        classes (
+          class_name,
+          subject,
+          teacher_id,
+          teachers (
+            user_id,
+            users (name)
+          )
+        )
+      `)
+      .eq('student_id', student.id);
+
+    if (enrollError) {
+      console.error('Error fetching enrollments:', enrollError);
+    }
+
+    const classes = enrollments?.map(e => e.classes.class_name) || [];
+    const teacherName = enrollments?.[0]?.classes?.teachers?.users?.name || 'No teacher assigned';
+
+    res.json({
+      success: true,
+      student: {
+        id: student.id,
+        studentNumber: student.student_number,
+        name: studentUser.name,
+        grade: student.grade,
+        teacher: teacherName,
+        classes
+      }
+    });
+  } catch (error) {
+    console.error('Error linking student:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get linked students for a parent
+app.get('/api/parent/linked-students', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'parent') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Get parent record
+    const { data: parent, error: parentError } = await supabase
+      .from('parents')
+      .select('id')
+      .eq('user_id', req.user.userId)
+      .single();
+
+    if (parentError || !parent) {
+      return res.status(404).json({ error: 'Parent not found' });
+    }
+
+    // Get linked students
+    const { data: links, error: linksError } = await supabase
+      .from('parent_student_links')
+      .select(`
+        student_id,
+        students (
+          id,
+          student_number,
+          grade,
+          user_id,
+          users (name, email)
+        )
+      `)
+      .eq('parent_id', parent.id);
+
+    if (linksError) {
+      console.error('Error fetching linked students:', linksError);
+      return res.status(500).json({ error: 'Failed to fetch linked students' });
+    }
+
+    // Get enrollments and classes for each student
+    const studentsWithDetails = await Promise.all(
+      (links || []).map(async (link) => {
+        const student = link.students;
+        
+        // Get student's enrolled classes
+        const { data: enrollments, error: enrollError } = await supabase
+          .from('enrollments')
+          .select(`
+            class_id,
+            classes (
+              class_name,
+              subject,
+              teacher_id,
+              teachers (
+                user_id,
+                users (name)
+              )
+            )
+          `)
+          .eq('student_id', student.id);
+
+        if (enrollError) {
+          console.error('Error fetching enrollments:', enrollError);
+        }
+
+        const classes = enrollments?.map(e => e.classes.class_name) || [];
+        const teacherName = enrollments?.[0]?.classes?.teachers?.users?.name || 'No teacher assigned';
+
+        return {
+          id: student.id,
+          studentNumber: student.student_number,
+          name: student.users.name,
+          grade: student.grade,
+          teacher: teacherName,
+          classes
+        };
+      })
+    );
+
+    res.json({ linkedStudents: studentsWithDetails });
+  } catch (error) {
+    console.error('Error fetching linked students:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get student progress data for parent
+app.get('/api/parent/student-progress/:studentId', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'parent') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { studentId } = req.params;
+
+    // Verify parent has access to this student
+    const { data: parent } = await supabase
+      .from('parents')
+      .select('id')
+      .eq('user_id', req.user.userId)
+      .single();
+
+    if (!parent) {
+      return res.status(404).json({ error: 'Parent not found' });
+    }
+
+    const { data: link } = await supabase
+      .from('parent_student_links')
+      .select('id')
+      .eq('parent_id', parent.id)
+      .eq('student_id', studentId)
+      .single();
+
+    if (!link) {
+      return res.status(403).json({ error: 'Access denied to this student' });
+    }
+
+    // Get quiz submissions with scores
+    const { data: quizSubmissions } = await supabase
+      .from('quiz_submissions')
+      .select(`
+        score,
+        submitted_at,
+        quizzes (
+          title,
+          grade
+        )
+      `)
+      .eq('student_id', studentId)
+      .order('submitted_at', { ascending: false })
+      .limit(10);
+
+    // Get lesson completions
+    const { data: lessonCompletions } = await supabase
+      .from('lesson_completions')
+      .select(`
+        stars,
+        completed_at,
+        lessons (
+          title,
+          grade
+        )
+      `)
+      .eq('student_id', studentId)
+      .order('completed_at', { ascending: false })
+      .limit(10);
+
+    // Get enrollment progress
+    const { data: enrollments } = await supabase
+      .from('enrollments')
+      .select(`
+        progress,
+        classes (
+          class_name,
+          subject,
+          grade
+        )
+      `)
+      .eq('student_id', studentId);
+
+    // Calculate statistics
+    const averageScore = quizSubmissions?.length > 0
+      ? Math.round(quizSubmissions.reduce((sum, sub) => sum + (sub.score || 0), 0) / quizSubmissions.length)
+      : 0;
+
+    const totalLessons = lessonCompletions?.length || 0;
+    const averageStars = lessonCompletions?.length > 0
+      ? (lessonCompletions.reduce((sum, lc) => sum + (lc.stars || 0), 0) / lessonCompletions.length).toFixed(1)
+      : 0;
+
+    // Format recent activities (combine quizzes and lessons)
+    const recentActivities = [
+      ...(quizSubmissions || []).map(sub => ({
+        type: 'quiz',
+        title: sub.quizzes?.title || 'Quiz',
+        score: sub.score,
+        date: new Date(sub.submitted_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+      })),
+      ...(lessonCompletions || []).map(lc => ({
+        type: 'lesson',
+        title: lc.lessons?.title || 'Lesson',
+        stars: lc.stars,
+        date: new Date(lc.completed_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+      }))
+    ].sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 10);
+
+    res.json({
+      stats: {
+        averageScore,
+        totalLessons,
+        averageStars,
+        totalQuizzes: quizSubmissions?.length || 0
+      },
+      recentActivities,
+      enrollments: enrollments?.map(e => ({
+        className: e.classes.class_name,
+        subject: e.classes.subject,
+        grade: e.classes.grade,
+        progress: e.progress || 0
+      })) || []
+    });
+  } catch (error) {
+    console.error('Error fetching student progress:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 // ============================================
 // TEACHER ENDPOINTS
@@ -1141,6 +2073,230 @@ app.patch('/api/teacher/lesson/:id/publish', authenticateToken, async (req, res)
   }
 });
 
+// Upload quiz media to Supabase Storage
+app.post('/api/teacher/quiz/upload', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'teacher') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { fileName, fileType, fileData } = req.body;
+
+    if (!fileName || !fileType || !fileData) {
+      return res.status(400).json({ error: 'File name, type, and data are required' });
+    }
+
+    // Validate Supabase configuration
+    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+      return res.status(500).json({ 
+        error: 'Supabase configuration missing',
+        details: 'SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set'
+      });
+    }
+
+    // Convert base64 to buffer
+    let base64Data;
+    try {
+      base64Data = fileData.includes(',') ? fileData.split(',')[1] : fileData;
+      if (!base64Data) {
+        throw new Error('Invalid base64 data');
+      }
+    } catch (err) {
+      return res.status(400).json({ error: 'Invalid file data format' });
+    }
+
+    const buffer = Buffer.from(base64Data, 'base64');
+
+    // Validate buffer
+    if (buffer.length === 0) {
+      return res.status(400).json({ error: 'Empty file data' });
+    }
+
+    // Generate unique filename
+    const timestamp = Date.now();
+    const sanitizedFileName = fileName.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const uniqueFileName = `${timestamp}-${sanitizedFileName}`;
+    const filePath = `quiz-media/${uniqueFileName}`;
+
+    console.log(`Uploading quiz media: ${filePath}, size: ${buffer.length} bytes`);
+
+    // Upload to Supabase Storage with retry logic
+    let uploadData, uploadError;
+    let retries = 3;
+    
+    while (retries > 0) {
+      const result = await supabase
+        .storage
+        .from('lesson-materials')
+        .upload(filePath, buffer, {
+          contentType: fileType,
+          upsert: false,
+          duplex: 'half'
+        });
+      
+      uploadData = result.data;
+      uploadError = result.error;
+      
+      if (!uploadError) break;
+      
+      // If it's a network error, retry
+      if (uploadError.message && uploadError.message.includes('fetch failed')) {
+        retries--;
+        if (retries > 0) {
+          console.log(`Upload failed, retrying... (${retries} attempts left)`);
+          await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
+          continue;
+        }
+      }
+      break;
+    }
+
+    if (uploadError) {
+      console.error('Supabase upload error:', uploadError);
+      
+      // Provide specific error messages
+      if (uploadError.message && uploadError.message.includes('not found')) {
+        return res.status(500).json({ 
+          error: 'Storage bucket not configured. Please create "lesson-materials" bucket in Supabase Storage.',
+          details: uploadError.message
+        });
+      }
+      
+      if (uploadError.message && uploadError.message.includes('fetch failed')) {
+        return res.status(500).json({ 
+          error: 'Connection to Supabase Storage failed. Please check your network connection and Supabase URL.',
+          details: uploadError.message
+        });
+      }
+      
+      return res.status(500).json({ 
+        error: 'Failed to upload file', 
+        details: uploadError.message || 'Unknown error'
+      });
+    }
+
+    // Get public URL
+    const { data: urlData } = supabase
+      .storage
+      .from('lesson-materials')
+      .getPublicUrl(filePath);
+
+    console.log(`Quiz media uploaded successfully: ${urlData.publicUrl}`);
+
+    res.json({
+      success: true,
+      file: {
+        name: fileName,
+        type: fileType,
+        url: urlData.publicUrl,
+        size: buffer.length,
+        path: filePath
+      }
+    });
+  } catch (error) {
+    console.error('Quiz upload error:', error);
+    res.status(500).json({ 
+      error: 'Server error', 
+      details: error.message || 'Unknown error'
+    });
+  }
+});
+
+// Get all quizzes for teacher
+app.get('/api/teacher/quizzes', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'teacher') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Get teacher record
+    const { data: teacher } = await supabase
+      .from('teachers')
+      .select('*')
+      .eq('user_id', req.user.userId)
+      .single();
+
+    if (!teacher) {
+      return res.status(404).json({ error: 'Teacher not found' });
+    }
+
+    // Get all quizzes with questions count
+    const { data: quizzes } = await supabase
+      .from('quizzes')
+      .select(`
+        *,
+        quiz_questions (count)
+      `)
+      .eq('teacher_id', teacher.id)
+      .order('created_at', { ascending: false });
+
+    // Get quiz assignments and submissions for each quiz
+    const quizzesWithStats = await Promise.all(quizzes?.map(async (quiz) => {
+      // Get assignments
+      const { data: assignments } = await supabase
+        .from('quiz_assignments')
+        .select(`
+          *,
+          classes (
+            id,
+            class_name,
+            enrollments (count)
+          )
+        `)
+        .eq('quiz_id', quiz.id);
+
+      // Calculate total students across all assigned classes
+      const totalStudents = assignments?.reduce((sum, assignment) => {
+        return sum + (assignment.classes?.enrollments?.[0]?.count || 0);
+      }, 0) || 0;
+
+      // Get submissions
+      const { data: submissions } = await supabase
+        .from('quiz_submissions')
+        .select('score')
+        .eq('quiz_id', quiz.id);
+
+      const submissionCount = submissions?.length || 0;
+      const avgScore = submissions?.length > 0
+        ? Math.round(submissions.reduce((sum, sub) => sum + (sub.score || 0), 0) / submissions.length)
+        : 0;
+
+      // Determine status
+      let status = quiz.status === 'published' ? 'Active' : 'Draft';
+      const isAssigned = assignments && assignments.length > 0;
+      
+      // Check if completed (past due date and all submitted)
+      if (isAssigned && assignments.some(a => a.due_date && new Date(a.due_date) < new Date())) {
+        const allSubmitted = totalStudents > 0 && submissionCount >= totalStudents;
+        if (allSubmitted) {
+          status = 'Completed';
+        }
+      }
+
+      return {
+        id: quiz.id,
+        title: quiz.title,
+        grade: quiz.grade,
+        description: quiz.description,
+        questions: quiz.quiz_questions?.[0]?.count || 0,
+        timeLimit: quiz.time_limit,
+        assigned: isAssigned,
+        submissions: submissionCount,
+        totalStudents,
+        avgScore,
+        status,
+        dueDate: assignments?.[0]?.due_date ? new Date(assignments[0].due_date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : null,
+        createdAt: quiz.created_at
+      };
+    }) || []);
+
+    res.json({ quizzes: quizzesWithStats });
+  } catch (error) {
+    console.error('Get quizzes error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // Create quiz
 app.post('/api/teacher/quiz', authenticateToken, async (req, res) => {
   try {
@@ -1188,6 +2344,7 @@ app.post('/api/teacher/quiz', authenticateToken, async (req, res) => {
       correct_answer: q.correctAnswer?.toString() || null,
       media_type: q.media?.type || null,
       media_url: q.media?.url || null,
+      points: q.points || 1, // Default to 1 point if not specified
       order_number: index + 1
     }));
 
@@ -1201,9 +2358,165 @@ app.post('/api/teacher/quiz', authenticateToken, async (req, res) => {
       return res.status(500).json({ error: 'Failed to create quiz questions' });
     }
 
+    // Calculate and update total points
+    const totalPoints = questionData.reduce((sum, q) => sum + (q.points || 1), 0);
+    await supabase
+      .from('quizzes')
+      .update({ total_points: totalPoints })
+      .eq('id', quiz.id);
+
     res.status(201).json({ message: 'Quiz created successfully', quiz });
   } catch (error) {
     console.error('Create quiz error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Delete quiz
+app.delete('/api/teacher/quiz/:id', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'teacher') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { id } = req.params;
+
+    // Get teacher record
+    const { data: teacher } = await supabase
+      .from('teachers')
+      .select('*')
+      .eq('user_id', req.user.userId)
+      .single();
+
+    // Verify quiz belongs to teacher
+    const { data: quiz } = await supabase
+      .from('quizzes')
+      .select('*')
+      .eq('id', id)
+      .eq('teacher_id', teacher.id)
+      .single();
+
+    if (!quiz) {
+      return res.status(404).json({ error: 'Quiz not found' });
+    }
+
+    // Delete quiz (cascade will handle questions and assignments)
+    const { error } = await supabase
+      .from('quizzes')
+      .delete()
+      .eq('id', id);
+
+    if (error) {
+      return res.status(500).json({ error: 'Failed to delete quiz' });
+    }
+
+    res.json({ message: 'Quiz deleted successfully' });
+  } catch (error) {
+    console.error('Delete quiz error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Get quiz assignments
+app.get('/api/teacher/quiz/:id/assignments', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'teacher') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { id } = req.params;
+
+    // Get teacher record
+    const { data: teacher } = await supabase
+      .from('teachers')
+      .select('*')
+      .eq('user_id', req.user.userId)
+      .single();
+
+    // Verify quiz belongs to teacher
+    const { data: quiz } = await supabase
+      .from('quizzes')
+      .select('*')
+      .eq('id', id)
+      .eq('teacher_id', teacher.id)
+      .single();
+
+    if (!quiz) {
+      return res.status(404).json({ error: 'Quiz not found' });
+    }
+
+    // Get assigned classes
+    const { data: assignments } = await supabase
+      .from('quiz_assignments')
+      .select('class_id')
+      .eq('quiz_id', id);
+
+    const assignedClassIds = assignments ? assignments.map(a => a.class_id) : [];
+
+    res.json({ assignedClassIds });
+  } catch (error) {
+    console.error('Get quiz assignments error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Assign quiz to classes
+app.post('/api/teacher/quiz/:id/assign', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'teacher') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { id } = req.params;
+    const { classIds, dueDate } = req.body;
+
+    // Get teacher record
+    const { data: teacher } = await supabase
+      .from('teachers')
+      .select('*')
+      .eq('user_id', req.user.userId)
+      .single();
+
+    // Verify quiz belongs to teacher
+    const { data: quiz } = await supabase
+      .from('quizzes')
+      .select('*')
+      .eq('id', id)
+      .eq('teacher_id', teacher.id)
+      .single();
+
+    if (!quiz) {
+      return res.status(404).json({ error: 'Quiz not found' });
+    }
+
+    // Delete existing assignments
+    await supabase
+      .from('quiz_assignments')
+      .delete()
+      .eq('quiz_id', id);
+
+    // Create new assignments
+    if (classIds && classIds.length > 0) {
+      const assignments = classIds.map(classId => ({
+        quiz_id: id,
+        class_id: classId,
+        assigned_date: new Date().toISOString(),
+        due_date: dueDate || null
+      }));
+
+      const { error } = await supabase
+        .from('quiz_assignments')
+        .insert(assignments);
+
+      if (error) {
+        console.error('Assignment error:', error);
+        return res.status(500).json({ error: 'Failed to assign quiz', details: error.message });
+      }
+    }
+
+    res.json({ message: 'Quiz assigned successfully' });
+  } catch (error) {
+    console.error('Assign quiz error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -1383,15 +2696,20 @@ app.get('/api/teacher/classroom', authenticateToken, async (req, res) => {
       };
     }) || [];
 
-    // Format classes with counts
-    const formattedClasses = classes?.map(cls => {
-      const studentCount = enrollments?.filter(e => e.class_id === cls.id).length || 0;
-      return {
-        id: cls.id,
-        name: cls.class_name,
-        count: studentCount
-      };
-    }) || [];
+    // Format classes with counts and ensure uniqueness
+    const uniqueClasses = new Map();
+    classes?.forEach(cls => {
+      if (!uniqueClasses.has(cls.id)) {
+        const studentCount = enrollments?.filter(e => e.class_id === cls.id).length || 0;
+        uniqueClasses.set(cls.id, {
+          id: cls.id,
+          name: cls.class_name,
+          count: studentCount
+        });
+      }
+    });
+
+    const formattedClasses = Array.from(uniqueClasses.values());
 
     res.json({
       classes: [
@@ -1724,13 +3042,103 @@ app.get('/api/student/dashboard', authenticateToken, async (req, res) => {
       progress: e.progress || 0
     })) || [];
 
+    // Get class IDs
+    const classIds = classes.map(c => c.id);
+
+    // Get assigned lessons for these classes
+    const { data: lessonAssignments } = await supabase
+      .from('lesson_assignments')
+      .select(`
+        *,
+        lessons (
+          *,
+          lesson_files (*)
+        )
+      `)
+      .in('class_id', classIds);
+
+    // Get lesson completions for this student
+    const lessonIds = lessonAssignments?.map(a => a.lessons.id) || [];
+    const { data: completions } = await supabase
+      .from('lesson_completions')
+      .select('*')
+      .eq('student_id', student.id)
+      .in('lesson_id', lessonIds);
+
+    // Create completion map for quick lookup
+    const completionMap = {};
+    completions?.forEach(c => {
+      completionMap[c.lesson_id] = {
+        completed: true,
+        stars: c.stars || 0,
+        completedAt: c.completed_at
+      };
+    });
+
+    // Format lessons with files and class info
+    const lessons = lessonAssignments?.map(assignment => {
+      const classInfo = classes.find(c => c.id === assignment.class_id);
+      const completion = completionMap[assignment.lessons.id] || { completed: false, stars: 0 };
+      
+      return {
+        id: assignment.lessons.id,
+        title: assignment.lessons.title,
+        grade: assignment.lessons.grade,
+        description: assignment.lessons.description,
+        objectives: assignment.lessons.objectives,
+        status: assignment.lessons.status,
+        classId: assignment.class_id,
+        className: classInfo?.className || 'Unknown Class',
+        files: assignment.lessons.lesson_files || [],
+        completed: completion.completed,
+        stars: completion.stars,
+        completedAt: completion.completedAt,
+        locked: false
+      };
+    }) || [];
+
+    // Get quiz submissions for stats
+    const { data: quizSubmissions } = await supabase
+      .from('quiz_submissions')
+      .select('score')
+      .eq('student_id', student.id);
+
+    // Calculate stats from lesson completions
+    const totalStarsFromLessons = completions?.reduce((sum, c) => sum + (c.stars || 0), 0) || 0;
+    const totalStarsFromQuizzes = quizSubmissions?.reduce((sum, sub) => {
+      if (sub.score >= 90) return sum + 3;
+      if (sub.score >= 75) return sum + 2;
+      if (sub.score >= 60) return sum + 1;
+      return sum;
+    }, 0) || 0;
+    const totalStars = totalStarsFromLessons + totalStarsFromQuizzes;
+    const completedLessonsCount = completions?.length || 0;
+
+    const recentQuizzes = quizSubmissions?.slice(-5).map((sub, idx) => ({
+      id: idx,
+      title: `Quiz ${idx + 1}`,
+      score: sub.score || 0,
+      date: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+    })) || [];
+
     res.json({
       student: {
         id: student.id,
-        studentNumber: student.student_number,
-        grade: student.grade
+        grade: student.grade,
+        studentNumber: student.student_number
       },
-      classes
+      classes,
+      lessons,
+      stats: {
+        totalStars,
+        level: Math.floor(totalStars / 10) + 1,
+        streak: 0, // TODO: Implement streak tracking
+        completedLessons: completedLessonsCount,
+        totalLessons: lessons.length
+      },
+      currentLesson: lessons.length > 0 ? lessons[0].title : 'No active lesson',
+      recentQuizzes,
+      achievements: [] // TODO: Implement achievements
     });
   } catch (error) {
     console.error('Student dashboard error:', error);
@@ -1849,8 +3257,651 @@ app.patch('/api/student/grade', authenticateToken, async (req, res) => {
   }
 });
 
+// Complete a lesson
+app.post('/api/student/lesson/:id/complete', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'student') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { id } = req.params;
+    const { stars } = req.body; // Optional: stars earned (1-3)
+
+    // Get student record
+    const { data: student } = await supabase
+      .from('students')
+      .select('*')
+      .eq('user_id', req.user.userId)
+      .single();
+
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    // Verify lesson exists
+    const { data: lesson } = await supabase
+      .from('lessons')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (!lesson) {
+      return res.status(404).json({ error: 'Lesson not found' });
+    }
+
+    // Check if already completed
+    const { data: existing } = await supabase
+      .from('lesson_completions')
+      .select('*')
+      .eq('student_id', student.id)
+      .eq('lesson_id', id)
+      .single();
+
+    if (existing) {
+      // Update existing completion
+      const { error } = await supabase
+        .from('lesson_completions')
+        .update({
+          stars: stars || existing.stars,
+          completed_at: new Date().toISOString()
+        })
+        .eq('id', existing.id);
+
+      if (error) {
+        return res.status(500).json({ error: 'Failed to update lesson completion' });
+      }
+
+      return res.json({ 
+        message: 'Lesson completion updated',
+        stars: stars || existing.stars
+      });
+    }
+
+    // Create new completion record
+    const { data: completion, error } = await supabase
+      .from('lesson_completions')
+      .insert([{
+        student_id: student.id,
+        lesson_id: id,
+        stars: stars || 0,
+        completed_at: new Date().toISOString()
+      }])
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Lesson completion error:', error);
+      return res.status(500).json({ error: 'Failed to complete lesson' });
+    }
+
+    // Update student's overall progress in enrolled classes
+    // Get all classes this lesson is assigned to
+    const { data: assignments } = await supabase
+      .from('lesson_assignments')
+      .select('class_id')
+      .eq('lesson_id', id);
+
+    const classIds = assignments?.map(a => a.class_id) || [];
+
+    // Update progress for each enrolled class
+    for (const classId of classIds) {
+      const { data: enrollment } = await supabase
+        .from('enrollments')
+        .select('*')
+        .eq('student_id', student.id)
+        .eq('class_id', classId)
+        .single();
+
+      if (enrollment) {
+        // Get total lessons and quizzes for this class
+        const { data: totalLessons } = await supabase
+          .from('lesson_assignments')
+          .select('lesson_id')
+          .eq('class_id', classId);
+
+        const { data: totalQuizzes } = await supabase
+          .from('quiz_assignments')
+          .select('quiz_id')
+          .eq('class_id', classId);
+
+        // Get completed lessons and quizzes for this student in this class
+        const lessonIds = totalLessons?.map(l => l.lesson_id) || [];
+        const quizIds = totalQuizzes?.map(q => q.quiz_id) || [];
+
+        const { data: completedLessons } = await supabase
+          .from('lesson_completions')
+          .select('lesson_id')
+          .eq('student_id', student.id)
+          .in('lesson_id', lessonIds);
+
+        const { data: completedQuizzes } = await supabase
+          .from('quiz_submissions')
+          .select('quiz_id')
+          .eq('student_id', student.id)
+          .in('quiz_id', quizIds);
+
+        // Calculate progress percentage (lessons + quizzes)
+        const totalActivities = (totalLessons?.length || 0) + (totalQuizzes?.length || 0);
+        const completedActivities = (completedLessons?.length || 0) + (completedQuizzes?.length || 0);
+        
+        const progress = totalActivities > 0
+          ? Math.round((completedActivities / totalActivities) * 100)
+          : 0;
+
+        // Update enrollment progress
+        await supabase
+          .from('enrollments')
+          .update({ progress })
+          .eq('id', enrollment.id);
+      }
+    }
+
+    res.status(201).json({
+      message: 'Lesson completed successfully',
+      completion: {
+        id: completion.id,
+        lessonId: id,
+        stars: completion.stars,
+        completedAt: completion.completed_at
+      }
+    });
+  } catch (error) {
+    console.error('Complete lesson error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Get assigned quizzes for student
+app.get('/api/student/quizzes', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'student') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Get student record
+    const { data: student } = await supabase
+      .from('students')
+      .select('*')
+      .eq('user_id', req.user.userId)
+      .single();
+
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    // Get enrolled classes
+    const { data: enrollments } = await supabase
+      .from('enrollments')
+      .select('class_id')
+      .eq('student_id', student.id);
+
+    const classIds = enrollments?.map(e => e.class_id) || [];
+
+    if (classIds.length === 0) {
+      return res.json({ quizzes: [] });
+    }
+
+    // Get quiz assignments for these classes
+    const { data: assignments } = await supabase
+      .from('quiz_assignments')
+      .select(`
+        *,
+        quizzes (
+          *,
+          quiz_questions (count)
+        ),
+        classes (
+          class_name,
+          grade
+        )
+      `)
+      .in('class_id', classIds);
+
+    // Get student's quiz submissions
+    const quizIds = assignments?.map(a => a.quiz_id) || [];
+    const { data: submissions } = await supabase
+      .from('quiz_submissions')
+      .select('*')
+      .eq('student_id', student.id)
+      .in('quiz_id', quizIds);
+
+    // Create submission map
+    const submissionMap = {};
+    submissions?.forEach(sub => {
+      submissionMap[sub.quiz_id] = sub;
+    });
+
+    // Get question counts for each quiz
+    const questionCounts = {};
+    for (const assignment of assignments || []) {
+      const { count } = await supabase
+        .from('quiz_questions')
+        .select('*', { count: 'exact', head: true })
+        .eq('quiz_id', assignment.quiz_id);
+      questionCounts[assignment.quiz_id] = count || 0;
+    }
+
+    // Get submission counts (attempts)
+    const attemptCounts = {};
+    for (const quizId of quizIds) {
+      const { count } = await supabase
+        .from('quiz_submissions')
+        .select('*', { count: 'exact', head: true })
+        .eq('student_id', student.id)
+        .eq('quiz_id', quizId);
+      attemptCounts[quizId] = count || 0;
+    }
+
+    // Get best scores
+    const bestScores = {};
+    for (const quizId of quizIds) {
+      const { data: bestSubmission } = await supabase
+        .from('quiz_submissions')
+        .select('score')
+        .eq('student_id', student.id)
+        .eq('quiz_id', quizId)
+        .order('score', { ascending: false })
+        .limit(1)
+        .single();
+      if (bestSubmission) {
+        bestScores[quizId] = bestSubmission.score;
+      }
+    }
+
+    // Format quizzes to match frontend interface
+    const quizzes = assignments?.map(assignment => {
+      const hasSubmission = !!submissionMap[assignment.quiz_id];
+      
+      return {
+        id: assignment.quizzes.id,
+        title: assignment.quizzes.title,
+        description: assignment.quizzes.description,
+        totalPoints: assignment.quizzes.total_points || 100,
+        timeLimit: assignment.quizzes.time_limit || 30,
+        questionCount: questionCounts[assignment.quiz_id] || 0,
+        classId: assignment.class_id,
+        className: assignment.classes.class_name,
+        grade: assignment.classes.grade,
+        dueDate: assignment.due_date,
+        completed: hasSubmission,
+        bestScore: bestScores[assignment.quiz_id],
+        attempts: attemptCounts[assignment.quiz_id] || 0
+      };
+    }) || [];
+
+    res.json(quizzes);
+  } catch (error) {
+    console.error('Get student quizzes error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Get quiz details with questions
+app.get('/api/student/quiz/:id', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'student') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { id } = req.params;
+
+    // Get student record
+    const { data: student } = await supabase
+      .from('students')
+      .select('*')
+      .eq('user_id', req.user.userId)
+      .single();
+
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    // Get quiz with questions
+    const { data: quiz } = await supabase
+      .from('quizzes')
+      .select(`
+        *,
+        quiz_questions (*)
+      `)
+      .eq('id', id)
+      .single();
+
+    if (!quiz) {
+      return res.status(404).json({ error: 'Quiz not found' });
+    }
+
+    // Verify student has access to this quiz (enrolled in assigned class)
+    const { data: enrollments } = await supabase
+      .from('enrollments')
+      .select('class_id')
+      .eq('student_id', student.id);
+
+    const classIds = enrollments?.map(e => e.class_id) || [];
+
+    const { data: assignment } = await supabase
+      .from('quiz_assignments')
+      .select('*')
+      .eq('quiz_id', id)
+      .in('class_id', classIds)
+      .single();
+
+    if (!assignment) {
+      return res.status(403).json({ error: 'Quiz not assigned to your class' });
+    }
+
+    // Check if already submitted
+    const { data: existingSubmission } = await supabase
+      .from('quiz_submissions')
+      .select('*')
+      .eq('quiz_id', id)
+      .eq('student_id', student.id)
+      .single();
+
+    if (existingSubmission) {
+      return res.status(400).json({ 
+        error: 'Quiz already submitted',
+        submission: existingSubmission
+      });
+    }
+
+    res.json({
+      quiz: {
+        id: quiz.id,
+        title: quiz.title,
+        description: quiz.description,
+        time_limit_minutes: quiz.time_limit,
+        total_points: quiz.total_points,
+        questions: quiz.quiz_questions.map(q => ({
+          id: q.id,
+          question_text: q.question_text,
+          question_type: q.question_type,
+          options: q.options ? (typeof q.options === 'string' ? JSON.parse(q.options) : q.options) : null,
+          correct_answer: q.correct_answer,
+          points: q.points,
+          media_url: q.media_url,
+          media_type: q.media_type
+        }))
+      }
+    });
+  } catch (error) {
+    console.error('Get quiz details error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Submit quiz answers
+app.post('/api/student/quiz/:id/submit', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'student') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const { id } = req.params;
+    const { answers } = req.body; // Array of { questionId, answer }
+
+    // Get student record
+    const { data: student } = await supabase
+      .from('students')
+      .select('*')
+      .eq('user_id', req.user.userId)
+      .single();
+
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    // Get quiz with questions and correct answers
+    const { data: quiz } = await supabase
+      .from('quizzes')
+      .select(`
+        *,
+        quiz_questions (*)
+      `)
+      .eq('id', id)
+      .single();
+
+    if (!quiz) {
+      return res.status(404).json({ error: 'Quiz not found' });
+    }
+
+    // Check if already submitted
+    const { data: existingSubmission } = await supabase
+      .from('quiz_submissions')
+      .select('*')
+      .eq('quiz_id', id)
+      .eq('student_id', student.id)
+      .single();
+
+    if (existingSubmission) {
+      return res.status(400).json({ error: 'Quiz already submitted' });
+    }
+
+    // Calculate score
+    let totalPoints = 0;
+    let earnedPoints = 0;
+    const results = [];
+
+    quiz.quiz_questions.forEach(question => {
+      // Convert questionId to string for comparison since it comes from frontend as string
+      const studentAnswer = answers.find(a => String(a.questionId) === String(question.id));
+      
+      // Normalize answers for comparison (trim whitespace and handle case for true/false)
+      let isCorrect = false;
+      if (studentAnswer && studentAnswer.answer && question.correct_answer) {
+        const studentAns = String(studentAnswer.answer).trim();
+        const correctAns = String(question.correct_answer).trim();
+        
+        // For multiple choice and true/false, do exact match
+        // For open-ended, teacher will grade manually (for now, mark as incorrect)
+        if (question.question_type === 'open-ended') {
+          isCorrect = false; // Open-ended requires manual grading
+        } else {
+          isCorrect = studentAns === correctAns;
+        }
+      }
+      
+      totalPoints += question.points || 1;
+      if (isCorrect) {
+        earnedPoints += question.points || 1;
+      }
+
+      results.push({
+        questionId: question.id,
+        studentAnswer: studentAnswer?.answer || null,
+        correctAnswer: question.correct_answer,
+        isCorrect,
+        points: isCorrect ? (question.points || 1) : 0
+      });
+    });
+
+    const score = totalPoints > 0 ? Math.round((earnedPoints / totalPoints) * 100) : 0;
+
+    // Save submission
+    const { data: submission, error } = await supabase
+      .from('quiz_submissions')
+      .insert([{
+        quiz_id: id,
+        student_id: student.id,
+        answers: answers,
+        score: score,
+        submitted_at: new Date().toISOString()
+      }])
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Quiz submission error:', error);
+      return res.status(500).json({ error: 'Failed to submit quiz' });
+    }
+
+    // Update enrollment progress
+    // Get the class this quiz is assigned to for this student
+    const { data: quizAssignments } = await supabase
+      .from('quiz_assignments')
+      .select('class_id')
+      .eq('quiz_id', id);
+
+    if (quizAssignments && quizAssignments.length > 0) {
+      // Get student's enrollments in these classes
+      const classIds = quizAssignments.map(qa => qa.class_id);
+      const { data: enrollments } = await supabase
+        .from('enrollments')
+        .select('id, class_id, progress')
+        .eq('student_id', student.id)
+        .in('class_id', classIds);
+
+      // Update progress for each enrollment
+      for (const enrollment of enrollments || []) {
+        // Get total assigned quizzes and lessons for this class
+        const { data: totalQuizzes } = await supabase
+          .from('quiz_assignments')
+          .select('quiz_id')
+          .eq('class_id', enrollment.class_id);
+
+        const { data: totalLessons } = await supabase
+          .from('lesson_assignments')
+          .select('lesson_id')
+          .eq('class_id', enrollment.class_id);
+
+        // Get completed quizzes and lessons for this student in this class
+        const { data: completedQuizzes } = await supabase
+          .from('quiz_submissions')
+          .select('quiz_id')
+          .eq('student_id', student.id)
+          .in('quiz_id', (totalQuizzes || []).map(q => q.quiz_id));
+
+        const { data: completedLessons } = await supabase
+          .from('lesson_completions')
+          .select('lesson_id')
+          .eq('student_id', student.id)
+          .in('lesson_id', (totalLessons || []).map(l => l.lesson_id));
+
+        const totalActivities = (totalQuizzes?.length || 0) + (totalLessons?.length || 0);
+        const completedActivities = (completedQuizzes?.length || 0) + (completedLessons?.length || 0);
+        
+        const newProgress = totalActivities > 0 
+          ? Math.round((completedActivities / totalActivities) * 100)
+          : 0;
+
+        // Update enrollment progress
+        await supabase
+          .from('enrollments')
+          .update({ progress: newProgress })
+          .eq('id', enrollment.id);
+      }
+    }
+
+    res.status(201).json({
+      message: 'Quiz submitted successfully',
+      submission: {
+        id: submission.id,
+        score,
+        results,
+        submittedAt: submission.submitted_at
+      }
+    });
+  } catch (error) {
+    console.error('Submit quiz error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ============================================
+// UTILITY ENDPOINTS
+// ============================================
+
+// Recalculate progress for all enrollments
+app.post('/api/admin/recalculate-progress', authenticateToken, async (req, res) => {
+  try {
+    console.log('[RECALCULATE] Starting progress recalculation...');
+    
+    // Get all enrollments
+    const { data: enrollments, error: enrollError } = await supabase
+      .from('enrollments')
+      .select('id, student_id, class_id, progress');
+
+    if (enrollError) {
+      console.error('[RECALCULATE] Error fetching enrollments:', enrollError);
+      return res.status(500).json({ error: 'Failed to fetch enrollments' });
+    }
+
+    console.log(`[RECALCULATE] Found ${enrollments?.length || 0} enrollments to process`);
+
+    let updated = 0;
+    let skipped = 0;
+
+    // Process each enrollment
+    for (const enrollment of enrollments || []) {
+      try {
+        // Get total lessons and quizzes for this class
+        const { data: totalLessons } = await supabase
+          .from('lesson_assignments')
+          .select('lesson_id')
+          .eq('class_id', enrollment.class_id);
+
+        const { data: totalQuizzes } = await supabase
+          .from('quiz_assignments')
+          .select('quiz_id')
+          .eq('class_id', enrollment.class_id);
+
+        const lessonIds = totalLessons?.map(l => l.lesson_id) || [];
+        const quizIds = totalQuizzes?.map(q => q.quiz_id) || [];
+
+        // Get completed lessons and quizzes for this student
+        const { data: completedLessons } = await supabase
+          .from('lesson_completions')
+          .select('lesson_id')
+          .eq('student_id', enrollment.student_id)
+          .in('lesson_id', lessonIds);
+
+        const { data: completedQuizzes } = await supabase
+          .from('quiz_submissions')
+          .select('quiz_id')
+          .eq('student_id', enrollment.student_id)
+          .in('quiz_id', quizIds);
+
+        // Calculate progress
+        const totalActivities = (totalLessons?.length || 0) + (totalQuizzes?.length || 0);
+        const completedActivities = (completedLessons?.length || 0) + (completedQuizzes?.length || 0);
+        
+        const newProgress = totalActivities > 0
+          ? Math.round((completedActivities / totalActivities) * 100)
+          : 0;
+
+        // Update only if progress changed
+        if (newProgress !== enrollment.progress) {
+          await supabase
+            .from('enrollments')
+            .update({ progress: newProgress })
+            .eq('id', enrollment.id);
+          
+          console.log(`[RECALCULATE] Updated enrollment ${enrollment.id}: ${enrollment.progress}% → ${newProgress}%`);
+          updated++;
+        } else {
+          skipped++;
+        }
+      } catch (error) {
+        console.error(`[RECALCULATE] Error processing enrollment ${enrollment.id}:`, error);
+      }
+    }
+
+    console.log(`[RECALCULATE] Completed! Updated: ${updated}, Skipped: ${skipped}`);
+
+    res.json({
+      message: 'Progress recalculation completed',
+      stats: {
+        total: enrollments?.length || 0,
+        updated,
+        skipped
+      }
+    });
+  } catch (error) {
+    console.error('[RECALCULATE] Error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 // Start server
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
-  console.log('Supabase connected');
 });

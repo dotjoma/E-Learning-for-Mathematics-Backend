@@ -24,9 +24,13 @@ CREATE TABLE IF NOT EXISTS students (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   student_number TEXT UNIQUE,
+  student_sequence INTEGER UNIQUE,
   grade INTEGER,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+-- Create sequence for student numbers
+CREATE SEQUENCE IF NOT EXISTS student_number_seq START WITH 1;
 
 -- Parents table
 CREATE TABLE IF NOT EXISTS parents (
@@ -129,6 +133,16 @@ CREATE TABLE IF NOT EXISTS lesson_assignments (
   UNIQUE(lesson_id, class_id)
 );
 
+-- Lesson completions table (track student lesson completions)
+CREATE TABLE IF NOT EXISTS lesson_completions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  lesson_id UUID NOT NULL REFERENCES lessons(id) ON DELETE CASCADE,
+  stars INTEGER DEFAULT 0 CHECK (stars >= 0 AND stars <= 3),
+  completed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  UNIQUE(student_id, lesson_id)
+);
+
 -- Quizzes table
 CREATE TABLE IF NOT EXISTS quizzes (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -216,6 +230,8 @@ CREATE INDEX IF NOT EXISTS idx_lessons_teacher_id ON lessons(teacher_id);
 CREATE INDEX IF NOT EXISTS idx_lesson_files_lesson_id ON lesson_files(lesson_id);
 CREATE INDEX IF NOT EXISTS idx_lesson_assignments_lesson_id ON lesson_assignments(lesson_id);
 CREATE INDEX IF NOT EXISTS idx_lesson_assignments_class_id ON lesson_assignments(class_id);
+CREATE INDEX IF NOT EXISTS idx_lesson_completions_student_id ON lesson_completions(student_id);
+CREATE INDEX IF NOT EXISTS idx_lesson_completions_lesson_id ON lesson_completions(lesson_id);
 CREATE INDEX IF NOT EXISTS idx_quizzes_teacher_id ON quizzes(teacher_id);
 CREATE INDEX IF NOT EXISTS idx_quiz_questions_quiz_id ON quiz_questions(quiz_id);
 CREATE INDEX IF NOT EXISTS idx_quiz_assignments_quiz_id ON quiz_assignments(quiz_id);
@@ -238,6 +254,7 @@ ALTER TABLE activity_submissions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE lessons ENABLE ROW LEVEL SECURITY;
 ALTER TABLE lesson_files ENABLE ROW LEVEL SECURITY;
 ALTER TABLE lesson_assignments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE lesson_completions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE quizzes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE quiz_questions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE quiz_assignments ENABLE ROW LEVEL SECURITY;
@@ -297,6 +314,10 @@ CREATE POLICY "Lesson files are readable" ON lesson_files
 
 -- Lesson assignments are readable
 CREATE POLICY "Lesson assignments are readable" ON lesson_assignments
+  FOR SELECT USING (true);
+
+-- Lesson completions are readable
+CREATE POLICY "Lesson completions are readable" ON lesson_completions
   FOR SELECT USING (true);
 
 -- Quizzes are readable
